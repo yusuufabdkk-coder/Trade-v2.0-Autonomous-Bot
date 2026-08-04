@@ -1,0 +1,502 @@
+// ============================================================================
+// XAUUSDT AI Data Feeder — Pine Script v5
+// Tradev2.0 — Her 5 dakikada bir AI'a tam veri paketi gönderir
+// Alarm: "Any alert() function call" seçeneğiyle kur
+// ============================================================================
+
+//@version=5
+indicator("Trade v2.0 - AI Data Feeder", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=500)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INPUTS
+// ─────────────────────────────────────────────────────────────────────────────
+webhook_secret  = input.string("mysecretisonlyforme", "Webhook Secret")
+pivot_left      = input.int(10, "Pivot Left Bars",  minval=3, maxval=30)
+pivot_right     = input.int(5,  "Pivot Right Bars", minval=2, maxval=15)
+
+// Session times
+asia_session   = input.session("1800-0300", "Asia Session (NY Time)")
+london_session = input.session("0300-0800", "London Session (NY Time)")
+ny_session     = input.session("0800-1700", "NY Session (NY Time)")
+
+// AI Limits
+enable_filter       = input.bool(true,  "Yalnızca Fırsat Varsa Gönder",      group="AI Sınırlandırmaları")
+max_signals_per_day = input.int(12,     "Günlük Maksimum AI İstek Limiti",    group="AI Sınırlandırmaları", minval=1, maxval=288)
+cooldown_bars       = input.int(6,      "İstek Sonrası Bekleme Süresi (Mum)", group="AI Sınırlandırmaları", minval=0)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MTF BIAS
+// ─────────────────────────────────────────────────────────────────────────────
+f_get_tf_close(_tf) => request.security(syminfo.tickerid, _tf, close, barmerge.gaps_off, barmerge.lookahead_off)
+f_get_tf_ema(_tf, _len) => request.security(syminfo.tickerid, _tf, ta.ema(close, _len), barmerge.gaps_off, barmerge.lookahead_off)
+
+close_d   = f_get_tf_close("D")
+ema200_d  = f_get_tf_ema("D", 200)
+close_4h  = f_get_tf_close("240")
+ema200_4h = f_get_tf_ema("240", 200)
+close_1h  = f_get_tf_close("60")
+ema200_1h = f_get_tf_ema("60", 200)
+
+daily_bias       = close_d  > ema200_d  ? "BULLISH" : "BEARISH"
+h4_bias          = close_4h > ema200_4h ? "BULLISH" : "BEARISH"
+h1_bias          = close_1h > ema200_1h ? "BULLISH" : "BEARISH"
+
+htf_ph = request.security(syminfo.tickerid, "240", ta.pivothigh(high, 5, 5), barmerge.gaps_off, barmerge.lookahead_off)
+htf_pl = request.security(syminfo.tickerid, "240", ta.pivotlow(low, 5, 5), barmerge.gaps_off, barmerge.lookahead_off)
+
+var float htf_resistance = na
+var float htf_support = na
+if not na(htf_ph)
+    htf_resistance := htf_ph
+if not na(htf_pl)
+    htf_support := htf_pl
+
+
+ema9_cur   = ta.ema(close, 9)
+ema21_cur  = ta.ema(close, 21)
+ema50_cur  = ta.ema(close, 50)
+ema200_cur = ta.ema(close, 200)
+
+ema_trend_str    = close > ema200_cur ? "BULLISH" : "BEARISH"
+ema_50_200_state = ema50_cur > ema200_cur ? "BULLISH_ALIGNMENT" : ema50_cur < ema200_cur ? "BEARISH_ALIGNMENT" : "NEUTRAL"
+
+rsi_14   = nz(ta.rsi(close, 14), 50)
+atr_14   = nz(ta.atr(14), close * 0.001)
+vol_sma  = ta.sma(volume, 20)
+vol_delta_proxy = close > open ? volume : (close < open ? -volume : 0)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MOMENTUM & CONTEXT INDICATORS
+// ─────────────────────────────────────────────────────────────────────────────
+// MACD
+[macd_line, macd_signal, macd_hist] = ta.macd(close, 12, 26, 9)
+macd_status = macd_hist > 0 ? "BULLISH" : "BEARISH"
+
+// Stochastic RSI
+stoch_rsi_raw = ta.stoch(rsi_14, rsi_14, rsi_14, 14)
+stoch_rsi_k = ta.sma(stoch_rsi_raw, 3)
+stoch_rsi_d = ta.sma(stoch_rsi_k, 3)
+
+// VWAP
+vwap_val = ta.vwap(close)
+
+// Bollinger Bands
+[bb_mid, bb_upper, bb_lower] = ta.bb(close, 20, 2.0)
+bb_width = bb_mid > 0 ? (bb_upper - bb_lower) / bb_mid * 100 : 0
+
+// Daily Open & Previous Day High/Low
+daily_open    = request.security(syminfo.tickerid, "D", open, barmerge.gaps_off, barmerge.lookahead_on)
+prev_day_high = request.security(syminfo.tickerid, "D", high[1], barmerge.gaps_off, barmerge.lookahead_on)
+prev_day_low  = request.security(syminfo.tickerid, "D", low[1], barmerge.gaps_off, barmerge.lookahead_on)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PREMIUM / DISCOUNT
+// ─────────────────────────────────────────────────────────────────────────────
+highest_recent = ta.highest(high, 100)
+lowest_recent  = ta.lowest(low, 100)
+pd_equilibrium = (highest_recent + lowest_recent) / 2
+pd_zone        = close < pd_equilibrium ? "DISCOUNT" : "PREMIUM"
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SESSION & JUDAS SWING
+// ─────────────────────────────────────────────────────────────────────────────
+in_asia   = time(timeframe.period, asia_session,   "America/New_York") != 0
+in_london = time(timeframe.period, london_session, "America/New_York") != 0
+in_ny     = time(timeframe.period, ny_session,     "America/New_York") != 0
+
+current_session = in_asia ? "ASIA" : in_london ? "LONDON" : in_ny ? "NEW_YORK" : "NONE"
+
+var float asia_high = na
+var float asia_low  = na
+if in_asia
+    if not in_asia[1]
+        asia_high := high
+        asia_low  := low
+    else
+        asia_high := math.max(asia_high, high)
+        asia_low  := math.min(asia_low, low)
+
+var float london_high = na
+var float london_low  = na
+if in_london
+    if not in_london[1]
+        london_high := high
+        london_low  := low
+    else
+        london_high := math.max(london_high, high)
+        london_low  := math.min(london_low, low)
+
+
+var bool judas_bullish = false
+var bool judas_bearish = false
+if in_london and not in_london[1]
+    judas_bullish := false
+    judas_bearish := false
+if in_london
+    if not na(asia_low) and low < asia_low and close > asia_low
+        judas_bullish := true
+    if not na(asia_high) and high > asia_high and close < asia_high
+        judas_bearish := true
+
+judas_swing_active = judas_bullish or judas_bearish
+session_power_str  = judas_swing_active ? "JUDAS_SWING_CONFIRMED" : "NORMAL"
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PIVOTS & LIQUIDITY SWEEPS (SFP)
+// ─────────────────────────────────────────────────────────────────────────────
+ph = ta.pivothigh(high, pivot_left, pivot_right)
+pl = ta.pivotlow(low,  pivot_left, pivot_right)
+
+var float last_ph = na
+var float last_pl = na
+if not na(ph)
+    last_ph := ph
+if not na(pl)
+    last_pl := pl
+
+var bool   sfp_bullish = false
+var bool   sfp_bearish = false
+var string liq_type    = "NONE"
+var bool   liq_swept   = false
+var float  liq_level   = na
+
+sfp_bullish := false
+sfp_bearish := false
+if not na(last_pl) and low < last_pl and close > last_pl
+    sfp_bullish := true
+    liq_type    := "SELL_SIDE"
+    liq_swept   := true
+    liq_level   := last_pl
+if not na(last_ph) and high > last_ph and close < last_ph
+    sfp_bearish := true
+    liq_type    := "BUY_SIDE"
+    liq_swept   := true
+    liq_level   := last_ph
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ORDERFLOW & CANDLE PATTERNS
+// ─────────────────────────────────────────────────────────────────────────────
+candle_range   = high - low
+body_size      = math.abs(close - open)
+body_ratio     = candle_range > 0 ? body_size / candle_range : 0.0
+vol_ratio      = vol_sma > 0 ? volume / vol_sma : 0.0
+impulse_candle = body_ratio >= 0.60 and vol_ratio > 1.0
+orderflow_dir  = impulse_candle and close > open ? "BULLISH" : impulse_candle and close < open ? "BEARISH" : "NEUTRAL"
+
+bull_engulfing = close[1] < open[1] and close > open and close > open[1] and open < close[1]
+bear_engulfing = close[1] > open[1] and close < open and close < open[1] and open > close[1]
+candle_pattern = bull_engulfing ? "BULLISH_ENGULFING" : bear_engulfing ? "BEARISH_ENGULFING" : "NONE"
+
+// ─────────────────────────────────────────────────────────────────────────────
+// STRUCTURE (BoS / ChoCH / MSS)
+// ─────────────────────────────────────────────────────────────────────────────
+var string prev_trend_dir = "NONE"
+var bool   bos_bull       = false
+var bool   bos_bear       = false
+var bool   choch_bull     = false
+var bool   choch_bear     = false
+var string structure_type = "NONE"
+var string structure_dir  = "NONE"
+var float  broken_level   = na
+
+bos_bull   := false
+bos_bear   := false
+choch_bull := false
+choch_bear := false
+
+if barstate.isconfirmed
+    if not na(last_ph) and close > last_ph
+        if prev_trend_dir == "BEARISH"
+            choch_bull     := true
+            structure_type := (sfp_bullish[1] or sfp_bullish[2] or sfp_bullish) ? "MSS" : "ChoCH"
+        else
+            bos_bull       := true
+            structure_type := "BoS"
+        structure_dir  := "BULLISH"
+        broken_level   := last_ph
+        prev_trend_dir := "BULLISH"
+    else if not na(last_pl) and close < last_pl
+        if prev_trend_dir == "BULLISH"
+            choch_bear     := true
+            structure_type := (sfp_bearish[1] or sfp_bearish[2] or sfp_bearish) ? "MSS" : "ChoCH"
+        else
+            bos_bear       := true
+            structure_type := "BoS"
+        structure_dir  := "BEARISH"
+        broken_level   := last_pl
+        prev_trend_dir := "BEARISH"
+
+any_structure = bos_bull or bos_bear or choch_bull or choch_bear or structure_type == "MSS"
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FVG (Fair Value Gap)
+// ─────────────────────────────────────────────────────────────────────────────
+var array<float> fvg_top    = array.new_float(0)
+var array<float> fvg_bot    = array.new_float(0)
+var array<int>   fvg_bar    = array.new_int(0)
+var array<int>   fvg_dir    = array.new_int(0)
+var array<int>   fvg_status = array.new_int(0)
+var array<box>   fvg_boxes  = array.new_box(0)
+
+mid_range   = high[1] - low[1]
+mid_body    = math.abs(close[1] - open[1])
+mid_body_ok = mid_range > 0 ? (mid_body / mid_range) >= 0.60 : false
+fvg_min_gap = close * 0.0001
+
+bull_fvg_gap = low - high[2]
+bull_fvg_raw = low > high[2] and bull_fvg_gap >= fvg_min_gap and mid_body_ok
+bear_fvg_gap = low[2] - high
+bear_fvg_raw = high < low[2] and bear_fvg_gap >= fvg_min_gap and mid_body_ok
+
+var bool   active_fvg_exists = false
+var string active_fvg_dir    = "NONE"
+var float  active_fvg_low    = na
+var float  active_fvg_high   = na
+var string active_fvg_status = "NONE"
+
+if barstate.isconfirmed
+    if bull_fvg_raw
+        if array.size(fvg_top) >= 5
+            box.delete(array.shift(fvg_boxes))
+            array.shift(fvg_top)
+            array.shift(fvg_bot)
+            array.shift(fvg_bar)
+            array.shift(fvg_dir)
+            array.shift(fvg_status)
+        array.push(fvg_top, low)
+        array.push(fvg_bot, high[2])
+        array.push(fvg_bar, bar_index - 2)
+        array.push(fvg_dir, 1)
+        array.push(fvg_status, 0)
+        array.push(fvg_boxes, box.new(bar_index - 2, low, bar_index, high[2], border_color=color.new(color.green, 60), bgcolor=color.new(color.green, 85)))
+    if bear_fvg_raw
+        if array.size(fvg_top) >= 5
+            box.delete(array.shift(fvg_boxes))
+            array.shift(fvg_top)
+            array.shift(fvg_bot)
+            array.shift(fvg_bar)
+            array.shift(fvg_dir)
+            array.shift(fvg_status)
+        array.push(fvg_top, low[2])
+        array.push(fvg_bot, high)
+        array.push(fvg_bar, bar_index - 2)
+        array.push(fvg_dir, -1)
+        array.push(fvg_status, 0)
+        array.push(fvg_boxes, box.new(bar_index - 2, low[2], bar_index, high, border_color=color.new(color.red, 60), bgcolor=color.new(color.red, 85)))
+    if array.size(fvg_top) > 0
+        for i = array.size(fvg_top) - 1 to 0
+            if array.get(fvg_status, i) < 2
+                f_age = bar_index - array.get(fvg_bar, i)
+                f_t = array.get(fvg_top, i)
+                f_b = array.get(fvg_bot, i)
+                f_d = array.get(fvg_dir, i)
+                if f_age > 50
+                    array.set(fvg_status, i, 2)
+                    box.set_bgcolor(array.get(fvg_boxes, i), color.new(color.gray, 95))
+                else if f_d == 1
+                    if low <= f_b
+                        array.set(fvg_status, i, 2)
+                        box.set_bgcolor(array.get(fvg_boxes, i), color.new(color.gray, 95))
+                    else if low <= f_t
+                        array.set(fvg_status, i, 1)
+                else if f_d == -1
+                    if high >= f_t
+                        array.set(fvg_status, i, 2)
+                        box.set_bgcolor(array.get(fvg_boxes, i), color.new(color.gray, 95))
+                    else if high >= f_b
+                        array.set(fvg_status, i, 1)
+                if array.get(fvg_status, i) < 2
+                    box.set_right(array.get(fvg_boxes, i), bar_index)
+    active_fvg_exists := false
+    active_fvg_dir    := "NONE"
+    active_fvg_low    := na
+    active_fvg_high   := na
+    active_fvg_status := "NONE"
+    if array.size(fvg_top) > 0
+        for i = array.size(fvg_top) - 1 to 0
+            if array.get(fvg_status, i) <= 1 and not active_fvg_exists
+                active_fvg_exists := true
+                active_fvg_dir    := array.get(fvg_dir, i) == 1 ? "BULLISH" : "BEARISH"
+                active_fvg_high   := array.get(fvg_top, i)
+                active_fvg_low    := array.get(fvg_bot, i)
+                active_fvg_status := array.get(fvg_status, i) == 0 ? "ACTIVE" : "MITIGATED"
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ORDER BLOCKS
+// ─────────────────────────────────────────────────────────────────────────────
+var array<float> ob_top    = array.new_float(0)
+var array<float> ob_bot    = array.new_float(0)
+var array<int>   ob_bar    = array.new_int(0)
+var array<int>   ob_dir    = array.new_int(0)
+var array<int>   ob_status = array.new_int(0)
+var array<box>   ob_boxes  = array.new_box(0)
+ob_max_w = close * 0.005
+
+if barstate.isconfirmed
+    if structure_dir == "BULLISH" and structure_type != "NONE"
+        ob_found = false
+        for j = 1 to 20
+            if not ob_found and close[j] < open[j] and (high[j] - low[j]) <= ob_max_w
+                if array.size(ob_top) >= 5
+                    box.delete(array.shift(ob_boxes))
+                    array.shift(ob_top)
+                    array.shift(ob_bot)
+                    array.shift(ob_bar)
+                    array.shift(ob_dir)
+                    array.shift(ob_status)
+                array.push(ob_top, high[j])
+                array.push(ob_bot, low[j])
+                array.push(ob_bar, bar_index - j)
+                array.push(ob_dir, 1)
+                array.push(ob_status, 0)
+                array.push(ob_boxes, box.new(bar_index - j, high[j], bar_index, low[j], border_color=color.new(color.blue, 40), bgcolor=color.new(color.blue, 85)))
+                ob_found := true
+    if structure_dir == "BEARISH" and structure_type != "NONE"
+        ob_found = false
+        for j = 1 to 20
+            if not ob_found and close[j] > open[j] and (high[j] - low[j]) <= ob_max_w
+                if array.size(ob_top) >= 5
+                    box.delete(array.shift(ob_boxes))
+                    array.shift(ob_top)
+                    array.shift(ob_bot)
+                    array.shift(ob_bar)
+                    array.shift(ob_dir)
+                    array.shift(ob_status)
+                array.push(ob_top, high[j])
+                array.push(ob_bot, low[j])
+                array.push(ob_bar, bar_index - j)
+                array.push(ob_dir, -1)
+                array.push(ob_status, 0)
+                array.push(ob_boxes, box.new(bar_index - j, high[j], bar_index, low[j], border_color=color.new(color.orange, 40), bgcolor=color.new(color.orange, 85)))
+                ob_found := true
+    if array.size(ob_top) > 0
+        for i = array.size(ob_top) - 1 to 0
+            if array.get(ob_status, i) < 2
+                o_age = bar_index - array.get(ob_bar, i)
+                o_t = array.get(ob_top, i)
+                o_b = array.get(ob_bot, i)
+                o_d = array.get(ob_dir, i)
+                if o_age > 50
+                    array.set(ob_status, i, 2)
+                    box.set_bgcolor(array.get(ob_boxes, i), color.new(color.gray, 95))
+                else if o_d == 1
+                    if close < o_b
+                        array.set(ob_status, i, 2)
+                        box.set_bgcolor(array.get(ob_boxes, i), color.new(color.gray, 95))
+                    else if low <= o_t and close > o_b
+                        array.set(ob_status, i, 1)
+                else if o_d == -1
+                    if close > o_t
+                        array.set(ob_status, i, 2)
+                        box.set_bgcolor(array.get(ob_boxes, i), color.new(color.gray, 95))
+                    else if high >= o_b and close < o_t
+                        array.set(ob_status, i, 1)
+                if array.get(ob_status, i) < 2
+                    box.set_right(array.get(ob_boxes, i), bar_index)
+
+var bool   active_ob_exists = false
+var string active_ob_dir    = "NONE"
+var float  active_ob_low    = na
+var float  active_ob_high   = na
+var string active_ob_status = "NONE"
+if barstate.isconfirmed
+    active_ob_exists := false
+    active_ob_dir    := "NONE"
+    active_ob_low    := na
+    active_ob_high   := na
+    active_ob_status := "NONE"
+    if array.size(ob_top) > 0
+        for i = array.size(ob_top) - 1 to 0
+            if array.get(ob_status, i) <= 1 and not active_ob_exists
+                active_ob_exists := true
+                active_ob_dir    := array.get(ob_dir, i) == 1 ? "BULLISH" : "BEARISH"
+                active_ob_high   := array.get(ob_top, i)
+                active_ob_low    := array.get(ob_bot, i)
+                active_ob_status := array.get(ob_status, i) == 0 ? "ACTIVE" : "MITIGATED"
+
+pd_array_exists = active_fvg_exists or active_ob_exists
+pd_array_type   = active_fvg_exists ? "FVG" : active_ob_exists ? "OB" : "NONE"
+pd_array_dir    = active_fvg_exists ? active_fvg_dir : active_ob_exists ? active_ob_dir : "NONE"
+pd_array_lo     = active_fvg_exists ? active_fvg_low  : active_ob_exists ? active_ob_low  : na
+pd_array_hi     = active_fvg_exists ? active_fvg_high : active_ob_exists ? active_ob_high : na
+pd_array_stat   = active_fvg_exists ? active_fvg_status : active_ob_exists ? active_ob_status : "NONE"
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SMART FILTER & RATE LIMITER
+// ─────────────────────────────────────────────────────────────────────────────
+var int daily_count   = 0
+var int bars_since_last = 9999
+if dayofmonth != dayofmonth[1]
+    daily_count := 0
+bars_since_last += 1
+
+// Fırsat: yapı kırılımı, likidite temizliği veya aktif PD array
+bool has_setup = any_structure or liq_swept or pd_array_exists
+
+bool can_send = true
+if enable_filter and not has_setup
+    can_send := false
+if daily_count >= max_signals_per_day
+    can_send := false
+if bars_since_last < cooldown_bars
+    can_send := false
+
+// ─────────────────────────────────────────────────────────────────────────────
+// JSON PAYLOAD & ALERT
+// ─────────────────────────────────────────────────────────────────────────────
+exchange_sym = syminfo.prefix + ":" + syminfo.ticker
+chart_lnk    = "https://www.tradingview.com/chart/?symbol=" + str.replace_all(exchange_sym, ":", "%3A")
+
+if barstate.isconfirmed and can_send
+    string p1 = '{"symbol":"' + syminfo.ticker + '","exchange_symbol":"' + exchange_sym + '","timeframe":"' + timeframe.period + '","bar_time":"' + str.format("{0,date,yyyy-MM-dd'T'HH:mm:ss}Z", time) + '","chart_link":"' + chart_lnk + '",'
+    string p2 = '"price":' + str.tostring(close, "#.##") + ',"high":' + str.tostring(high, "#.##") + ',"low":' + str.tostring(low, "#.##") + ',"volume":' + str.tostring(volume, "#.##") + ',"atr":' + str.tostring(atr_14, "#.####") + ','
+    string p2a = '"volume_delta":' + str.tostring(nz(vol_delta_proxy, 0), "#.##") + ',"london_high":' + str.tostring(nz(london_high, 0), "#.##") + ',"london_low":' + str.tostring(nz(london_low, 0), "#.##") + ',"htf_resistance":' + str.tostring(nz(htf_resistance, 0), "#.##") + ',"htf_support":' + str.tostring(nz(htf_support, 0), "#.##") + ',"asia_high":' + str.tostring(nz(asia_high, 0), "#.##") + ',"asia_low":' + str.tostring(nz(asia_low, 0), "#.##") + ','
+    string p3 = '"rsi_14":' + str.tostring(rsi_14, "#.##") + ',"ema_9":' + str.tostring(ema9_cur, "#.##") + ',"ema_21":' + str.tostring(ema21_cur, "#.##") + ',"ema_50":' + str.tostring(ema50_cur, "#.##") + ',"ema_200":' + str.tostring(ema200_cur, "#.##") + ','
+    string p4 = '"ema_trend":"' + ema_trend_str + '","ema_50_200_state":"' + ema_50_200_state + '","daily_bias":"' + daily_bias + '","h4_bias":"' + h4_bias + '","h1_bias":"' + h1_bias + '",'
+    string p5 = '"premium_discount_zone":"' + pd_zone + '","session":"' + current_session + '","session_power":"' + session_power_str + '","judas_swing":' + (judas_swing_active ? "true" : "false") + ','
+    string p6 = '"structure_type":"' + structure_type + '","structure_direction":"' + structure_dir + '","broken_level":' + str.tostring(nz(broken_level, 0), "#.##") + ','
+    string p7 = '"liquidity_type":"' + liq_type + '","liquidity_swept":' + (liq_swept ? "true" : "false") + ',"liquidity_level":' + str.tostring(nz(liq_level, 0), "#.##") + ',"sfp_detected":' + ((sfp_bullish or sfp_bearish) ? "true" : "false") + ','
+    string p8 = '"pd_array_type":"' + pd_array_type + '","pd_array_direction":"' + pd_array_dir + '","zone_low":' + str.tostring(nz(pd_array_lo, 0), "#.##") + ',"zone_high":' + str.tostring(nz(pd_array_hi, 0), "#.##") + ',"zone_status":"' + pd_array_stat + '",'
+    string p9 = '"candle_pattern":"' + candle_pattern + '","orderflow_direction":"' + orderflow_dir + '","body_ratio":' + str.tostring(body_ratio, "#.###") + ',"volume_ratio":' + str.tostring(vol_ratio, "#.###") + ',"impulse_candle":' + (impulse_candle ? "true" : "false") + ','
+    string p10 = '"nearest_swing_high":' + str.tostring(nz(last_ph, 0), "#.##") + ',"nearest_swing_low":' + str.tostring(nz(last_pl, 0), "#.##") + ',"fvg_active":' + (active_fvg_exists ? "true" : "false") + ',"ob_active":' + (active_ob_exists ? "true" : "false") + ','
+    string p2b = '"macd_histogram":' + str.tostring(nz(macd_hist, 0), "#.####") + ',"macd_status":"' + macd_status + '","stoch_rsi_k":' + str.tostring(nz(stoch_rsi_k, 50), "#.##") + ',"stoch_rsi_d":' + str.tostring(nz(stoch_rsi_d, 50), "#.##") + ',"vwap":' + str.tostring(nz(vwap_val, 0), "#.##") + ',"bb_width":' + str.tostring(nz(bb_width, 0), "#.###") + ',"daily_open":' + str.tostring(nz(daily_open, 0), "#.##") + ',"prev_day_high":' + str.tostring(nz(prev_day_high, 0), "#.##") + ',"prev_day_low":' + str.tostring(nz(prev_day_low, 0), "#.##") + ','
+    string p11 = '"secret":"' + webhook_secret + '"}'
+    payload = p1 + p2 + p2a + p3 + p4 + p5 + p6 + p7 + p8 + p9 + p10 + p2b + p11
+    alert(payload, alert.freq_once_per_bar_close)
+    if barstate.isrealtime
+        daily_count     := daily_count + 1
+        bars_since_last := 0
+
+// ─────────────────────────────────────────────────────────────────────────────
+// VISUAL ELEMENTS
+// ─────────────────────────────────────────────────────────────────────────────
+plot(ema50_cur,  "EMA 50",  color=color.new(color.blue,   20), linewidth=2)
+plot(ema200_cur, "EMA 200", color=color.new(color.orange, 20), linewidth=2)
+
+bgcolor(h4_bias == "BULLISH" ? color.new(color.green, 95) : h4_bias == "BEARISH" ? color.new(color.red, 95) : na, title="H4 Trend Bias")
+
+plotshape(ph, title="Pivot High", style=shape.circle, location=location.abovebar, color=color.new(color.red,   50), size=size.tiny, offset=-pivot_right)
+plotshape(pl, title="Pivot Low",  style=shape.circle, location=location.belowbar, color=color.new(color.green, 50), size=size.tiny, offset=-pivot_right)
+
+var table info_table = table.new(position.top_right, 2, 8, bgcolor=color.new(color.black, 80), border_color=color.new(color.gray, 60), border_width=1)
+if barstate.islast
+    table.cell(info_table, 0, 0, "Daily / 4H / 1H",  text_color=color.gray,  text_size=size.small)
+    table.cell(info_table, 1, 0, daily_bias + " / " + h4_bias + " / " + h1_bias, text_color=color.white, text_size=size.small)
+    table.cell(info_table, 0, 1, "Session",           text_color=color.gray,  text_size=size.small)
+    table.cell(info_table, 1, 1, current_session + " | " + session_power_str, text_color=color.white, text_size=size.small)
+    table.cell(info_table, 0, 2, "Structure",         text_color=color.gray,  text_size=size.small)
+    table.cell(info_table, 1, 2, structure_type != "NONE" ? structure_type + " " + structure_dir : "—", text_color=color.white, text_size=size.small)
+    table.cell(info_table, 0, 3, "PD Array",          text_color=color.gray,  text_size=size.small)
+    table.cell(info_table, 1, 3, pd_array_exists ? pd_array_type + " " + pd_array_dir : "—", text_color=color.white, text_size=size.small)
+    table.cell(info_table, 0, 4, "Liq / SFP",         text_color=color.gray,  text_size=size.small)
+    table.cell(info_table, 1, 4, liq_swept ? liq_type + " Swept" : "—", text_color=color.white, text_size=size.small)
+    table.cell(info_table, 0, 5, "RSI / ATR",         text_color=color.gray,  text_size=size.small)
+    table.cell(info_table, 1, 5, str.tostring(rsi_14, "#.#") + " / " + str.tostring(atr_14, "#.##"), text_color=color.white, text_size=size.small)
+    table.cell(info_table, 0, 6, "AI Calls Today",    text_color=color.gray,  text_size=size.small)
+    table.cell(info_table, 1, 6, str.tostring(daily_count) + "/" + str.tostring(max_signals_per_day), text_color=color.yellow, text_size=size.small)
+    table.cell(info_table, 0, 7, "P/D Zone",          text_color=color.gray,  text_size=size.small)
+    table.cell(info_table, 1, 7, pd_zone,             text_color=pd_zone == "DISCOUNT" ? color.green : color.red, text_size=size.small)
+
+// ============================================================================
+// END OF SCRIPT
+// ============================================================================
